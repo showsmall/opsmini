@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/opsmini/opsmini/internal/agent"
 	"github.com/opsmini/opsmini/internal/config"
 	"github.com/opsmini/opsmini/internal/pkg/store"
 	"github.com/opsmini/opsmini/internal/router"
@@ -68,7 +69,12 @@ func main() {
 	metrics.Start()
 	defer metrics.Stop()
 
-	r := router.New(cfg, db, metrics, version)
+	// gRPC Agent lifecycle: managed by the router so the panel can reconnect it at
+	// runtime (empty server_addr means disconnected; config.yaml is the fallback).
+	hostname, _ := os.Hostname()
+	agentMgr := agent.NewManager(hostname, version)
+
+	r := router.New(cfg, db, metrics, version, agentMgr)
 	log.Printf("OpsMini agent listening on %s", cfg.Server.Addr())
 	if err := r.Run(cfg.Server.Addr()); err != nil {
 		log.Fatalf("server: %v", err)

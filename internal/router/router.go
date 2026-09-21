@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm"
 
 	v1 "github.com/opsmini/opsmini/internal/api/v1"
+	"github.com/opsmini/opsmini/internal/agent"
 	"github.com/opsmini/opsmini/internal/config"
 	"github.com/opsmini/opsmini/internal/middleware"
 	"github.com/opsmini/opsmini/internal/pkg/jwt"
@@ -22,7 +23,8 @@ import (
 )
 
 // New constructs the Gin engine and registers routes. version is the build version, exposed via healthz for silent version detection by the frontend.
-func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, version string) *gin.Engine {
+// agentMgr manages the Agent gRPC client lifecycle, allowing runtime reconfiguration of the OpsAnt link.
+func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, version string, agentMgr *agent.Manager) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 
@@ -63,7 +65,11 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 	authSvc := service.NewAuthService(userRepo, jwtMgr, func() bool {
 		v, err := settingSvc.Get("mfa_enabled")
 		return err == nil && v == "true"
-	})
+	}, func() bool {
+		v, err := settingSvc.Get("allow_opsant_sso")
+		// 默认打开：只有显式 "false" 才禁用（未设置/空/"true" 均为开启）
+		return err != nil || v == "" || v == "true"
+	}, cfg.Agent.ServerToken)
 	userSvc := service.NewUserService(userRepo)
 	auditSvc := service.NewAuditService(repository.NewAuditLogRepo(db))
 	authHandler := v1.NewAuthHandler(authSvc, auditSvc)
@@ -135,6 +141,11 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 
 	settingHandler := v1.NewSettingHandler(settingSvc)
 
+	// OpsAnt link configuration: panel settings override config.yaml, applied at runtime (Agent reconnect).
+	agentConfigSvc := service.NewAgentConfigService(settingSvc, agentMgr, cfg.Agent, int32(cfg.Server.Port))
+	agentConfigSvc.Init()
+	agentConfigHandler := v1.NewAgentConfigHandler(agentConfigSvc)
+
 	// Alert monitor: periodically evaluates rules, records events, and cleans up by retention time.
 	alertMonitor := service.NewAlertMonitor(
 		repository.NewAlertRuleRepo(db),
@@ -192,7 +203,6 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 		return v
 	}, sysSvc, firewallSvc, mcpSvc, skillSvc)
 	aiHandler := v1.NewAIHandler(aiSvc)
-	agentHandler := v1.NewAgentHandler(&cfg.Agent, version, sysSvc, websiteSvc, databaseSvc, cronSvc, dockerSvc, auditSvc)
 
 	// Software store: app list + one-click install/uninstall via Docker Shell scripts.
 	appStoreSvc := service.NewAppStoreService(
@@ -240,6 +250,7 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 			c.JSON(http.StatusOK, gin.H{"code": 0, "message": "ok", "data": gin.H{"status": "ok", "version": version}})
 		})
 		api.POST("/auth/login", loginLimiter.Limit(), authHandler.Login)
+		api.POST("/auth/sso", authHandler.SSOLogin)
 		api.POST("/auth/refresh", authHandler.Refresh)
 		api.POST("/auth/mfa/verify", loginLimiter.Limit(), authHandler.VerifyMFA)
 		api.POST("/auth/logout", authMw, authHandler.Logout)
@@ -300,6 +311,10 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 			authed.GET("/settings", permMw("settings.view"), settingHandler.List)
 			authed.PUT("/settings", permMw("settings.edit"), settingHandler.Update)
 
+			// OpsAnt link configuration (panel visualization)
+			authed.GET("/agent-config", permMw("settings.view"), agentConfigHandler.Get)
+			authed.PUT("/agent-config", permMw("settings.edit"), agentConfigHandler.Update)
+
 			// Dashboard / monitoring
 			authed.GET("/dashboard/overview", dashboardHandler.Overview)
 			authed.GET("/dashboard/metrics", dashboardHandler.Metrics)
@@ -312,6 +327,7 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 			authed.GET("/system/ports", systemHandler.Ports)
 			authed.GET("/system/disks", systemHandler.Disks)
 			authed.GET("/system/network", systemHandler.Networks)
+			authed.GET("/system/routes", systemHandler.Routes)
 			authed.GET("/system/users", systemHandler.Users)
 			authed.GET("/system/groups", systemHandler.Groups)
 			authed.GET("/system/firewall", systemHandler.Firewall)
@@ -398,6 +414,8 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 			// File management
 			authed.GET("/files", fileHandler.List)
 			authed.GET("/files/download", permMw("file.view"), fileHandler.Download)
+			authed.GET("/files/download-dir", permMw("file.view"), fileHandler.DownloadDir)
+			authed.GET("/files/du", permMw("file.view"), fileHandler.Du)
 			authed.POST("/files/mkdir", permMw("file.write"), fileHandler.MakeDir)
 			authed.POST("/files/rename", permMw("file.write"), fileHandler.Rename)
 			authed.POST("/files/delete", permMw("file.delete"), fileHandler.Delete)
@@ -435,29 +453,6 @@ func New(cfg *config.Config, db *gorm.DB, metrics *service.MetricCollector, vers
 		if dockerHandler != nil {
 			api.GET("/containers/:id/exec", dockerHandler.ContainerExec)
 		}
-	}
-
-	// Agent API (external machine interface with independent token authentication)
-	agentGroup := root.Group("/agent/v1")
-	agentGroup.Use(middleware.AgentAuth(func() string {
-		v, _ := settingSvc.Get("agent_token")
-		return v
-	}))
-	{
-		agentGroup.GET("/health", agentHandler.Health)
-		agentGroup.GET("/version", agentHandler.Version)
-		agentGroup.GET("/status", agentHandler.Status)
-		agentGroup.GET("/system/info", agentHandler.SystemInfo)
-		agentGroup.GET("/system/processes", agentHandler.Processes)
-		agentGroup.GET("/system/ports", agentHandler.Ports)
-		agentGroup.GET("/system/disks", agentHandler.Disks)
-		agentGroup.GET("/websites", agentHandler.Websites)
-		agentGroup.GET("/databases", agentHandler.Databases)
-		agentGroup.GET("/cron-jobs", agentHandler.CronJobs)
-		agentGroup.GET("/containers", agentHandler.Containers)
-		agentGroup.POST("/commands", agentHandler.Commands)
-		agentGroup.POST("/script/run", agentHandler.ScriptRun)
-		agentGroup.POST("/file/upload", agentHandler.FileUpload)
 	}
 
 	// Frontend static assets (embedded in the single binary). Static library content is stable, so add a one-year strong cache to avoid re-downloading large libraries on every login.
